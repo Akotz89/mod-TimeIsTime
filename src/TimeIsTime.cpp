@@ -12,11 +12,15 @@
 #include "Chat.h"
 #include "GameTime.h"
 
+#include <cmath>
+#include <ctime>
+#include <limits>
+
 static bool   stimeistime_enable,
               stimeistime_announce;
 static float  stimeistime_speed_rate,
               stimeistime_hour_offset;
-static uint32 stimeistime_time_start;
+static int64  stimeistime_time_start;
 
 class TimeIsTimeBeforeConfigLoad : public WorldScript {
 public:
@@ -28,7 +32,7 @@ public:
         stimeistime_announce = sConfigMgr->GetOption<bool>("TimeIsTime.Announce", true);
         stimeistime_speed_rate = sConfigMgr->GetOption<float>("TimeIsTime.SpeedRate", 1.0);
         stimeistime_hour_offset = sConfigMgr->GetOption<float>("TimeIsTime.HourOffset", 0.0);
-        stimeistime_time_start = sConfigMgr->GetOption<int>("TimeIsTime.TimeStart", 0);
+        stimeistime_time_start = sConfigMgr->GetOption<int64>("TimeIsTime.TimeStart", 0);
     }
 };
 
@@ -43,20 +47,33 @@ public:
     }
 	
     void OnPlayerSendInitialPacketsBeforeAddToMap(Player* player, WorldPacket& data) override {
-        if (!stimeistime_enable)
+        if (!stimeistime_enable || stimeistime_time_start < 0)
             return;
 
-        uint32 speed_time  = (GameTime::GetGameTime().count() - GameTime::GetUptime().count()) + (GameTime::GetUptime().count() * stimeistime_speed_rate);
-        float  hour_offset = stimeistime_hour_offset  * 3600;
-        uint32 time_start  = stimeistime_time_start + hour_offset;
+        double const now = double(GameTime::GetGameTime().count());
+        double const uptime = double(GameTime::GetUptime().count());
+        double const timestamp = stimeistime_time_start > 0
+            ? double(stimeistime_time_start) + double(stimeistime_hour_offset) * 3600.0
+            : now + uptime * (double(stimeistime_speed_rate) - 1.0);
+        if (!std::isfinite(stimeistime_speed_rate) || !std::isfinite(timestamp) ||
+            timestamp < double(std::numeric_limits<time_t>::lowest()) ||
+            timestamp >= double(std::numeric_limits<time_t>::max()))
+            return;
+
+        time_t const clientTime = time_t(timestamp);
+        std::tm calendar{};
+#if defined(_WIN32) || defined(_WIN64)
+        if (localtime_s(&calendar, &clientTime) != 0)
+#else
+        if (!localtime_r(&clientTime, &calendar))
+#endif
+            return;
+        // The packed-time year uses five bits relative to 2000.
+        if (calendar.tm_year < 100 || calendar.tm_year > 131)
+            return; // Retain the core's already-sent default clock packet.
 
         data.Initialize(SMSG_LOGIN_SETTIMESPEED, 4 + 4 + 4);
-        if (stimeistime_time_start > 0) {
-            data.AppendPackedTime(time_start);
-        }
-        else {
-            data.AppendPackedTime(speed_time);
-        }
+        data.AppendPackedTime(clientTime);
         data << float(0.01666667f) * stimeistime_speed_rate;
         data << uint32(0);
 
